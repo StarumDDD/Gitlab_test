@@ -1,72 +1,48 @@
 import requests
 import fnmatch
 import logging
-from urllib.parse import quote
-
+from math import ceil
+from typing import List, Dict, Set
 from dependency_parser_lib.language_depfiles import LANGUAGE_DEPENDENCY_FILES
 
 logger = logging.getLogger("smart_search")
 logging.basicConfig(level=logging.INFO)
 
+# --------------------------------------------------------------------------------
+# 1) Collect all file paths via tree(...) -> blobs(...) -> path
+# --------------------------------------------------------------------------------
 
-class QueryRepositoryFileListPaginated:
-    """
-    GraphQL query to fetch file paths (blobs) with pagination (no string.Template).
-    We directly store the query string and pass variables to GitLab.
-    """
-    def __init__(self):
-        self.text = """
-        query FetchBlobs($fullPath: ID!, $branch: String!, $after: String) {
-          project(fullPath: $fullPath) {
-            repository {
-              tree(ref: $branch, recursive: true) {
-                blobs(first: 100, after: $after) {
-                  pageInfo {
-                    hasNextPage
-                    endCursor
-                  }
-                  nodes {
-                    path
-                  }
-                }
-              }
-            }
+LIST_PATHS_QUERY = """
+query FetchPaths($fullPath: ID!, $ref: String!, $after: String) {
+  project(fullPath: $fullPath) {
+    repository {
+      tree(ref: $ref, recursive: true) {
+        blobs(first: 100, after: $after) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+          nodes {
+            path
           }
         }
-        """
+      }
+    }
+  }
+}
+"""
 
-
-class GitLabGraphQLAPI:
-    """Class for interacting with GitLab GraphQL API."""
-    BASE_URL = "https://gitlab.com/api/graphql"
-
-    def __init__(self, token: str = None):
-        self.headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        }
-
-    def execute_query(self, query: QueryRepositoryFileListPaginated, variables: dict):
-        """Executes the GraphQL query with variables and returns the JSON response."""
-        logger.info("Executing paginated GraphQL query...")
-        payload = {
-            "query": query.text,
-            "variables": variables
-        }
-        response = requests.post(self.BASE_URL, json=payload, headers=self.headers)
-        if response.status_code != 200:
-            raise Exception(f"GitLab GraphQL API error: {response.status_code} {response.text}")
-        return response.json()
-
-
-def list_repo_files_via_graphql_paginated(full_path: str, branch: str, token: str):
+def fetch_all_paths_graphql(token: str, full_path: str, ref: str) -> List[str]:
     """
-    Returns a list of file paths (blobs) in a GitLab repository by using a paginated GraphQL query.
+    Uses GitLab GraphQL to list all file paths in the repository (up to pagination).
+    Returns a list of file paths like ["README.md", "src/main.py", "subdir/requirements.txt", ...].
     """
-    logger.info(f"Listing repository files for branch '{branch}' via GraphQL with pagination...")
 
-    api = GitLabGraphQLAPI(token=token)
-    query = QueryRepositoryFileListPaginated()
+    base_url = "https://gitlab.com/api/graphql"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
 
     all_file_paths = []
     after_cursor = None
@@ -74,14 +50,29 @@ def list_repo_files_via_graphql_paginated(full_path: str, branch: str, token: st
     while True:
         variables = {
             "fullPath": full_path,
-            "branch": branch,
+            "ref": ref,
             "after": after_cursor
         }
-        response = api.execute_query(query, variables=variables)
-        logger.debug(f"GraphQL raw response: {response}")
+        logger.info(f"GraphQL: fetching file paths, after={after_cursor} ...")
 
-        data = response.get("data", {}).get("project", {}).get("repository", {}).get("tree", {})
-        blobs = data.get("blobs", {})
+        resp = requests.post(
+            base_url,
+            json={"query": LIST_PATHS_QUERY, "variables": variables},
+            headers=headers
+        )
+        if resp.status_code != 200:
+            raise Exception(f"GitLab GraphQL error: {resp.status_code} {resp.text}")
+
+        data = resp.json()
+        # Optional debug:
+        # logger.debug(f"Paths response: {data}")
+
+        tree_data = data.get("data", {}).get("project", {}).get("repository", {}).get("tree", {})
+        if not tree_data:
+            logger.warning("No project/repository data returned. Possibly no access or project not found.")
+            break
+
+        blobs = tree_data.get("blobs", {})
         nodes = blobs.get("nodes", [])
 
         for blob in nodes:
@@ -93,126 +84,214 @@ def list_repo_files_via_graphql_paginated(full_path: str, branch: str, token: st
         has_next = page_info.get("hasNextPage")
         end_cursor = page_info.get("endCursor")
 
-        logger.info(f"Fetched {len(nodes)} files in this batch, total so far: {len(all_file_paths)}")
+        logger.info(f"Fetched {len(nodes)} paths in this batch. Total so far: {len(all_file_paths)}")
 
         if has_next:
             after_cursor = end_cursor
-            logger.info(f"Continuing to next page with cursor '{after_cursor}'")
         else:
-            logger.info("No more pages. Finished fetching all file paths.")
+            logger.info("No more pages. Done collecting all file paths.")
             break
 
     return all_file_paths
 
+# --------------------------------------------------------------------------------
+# 2) Filter paths by fnmatch patterns from LANGUAGE_DEPENDENCY_FILES
+# --------------------------------------------------------------------------------
 
-def get_raw_file_content(project_path: str, file_path: str, branch: str, token: str) -> str:
+def filter_paths_by_dependency_patterns(all_paths: List[str]) -> List[str]:
     """
-    Uses the GitLab REST API to get the raw content of a file in a repository.
+    Returns only those paths that match at least one of the patterns in LANGUAGE_DEPENDENCY_FILES.
     """
-    encoded_project = quote(project_path, safe="")
-    encoded_file = quote(file_path, safe="")
-
-    url = f"https://gitlab.com/api/v4/projects/{encoded_project}/repository/files/{encoded_file}/raw"
-    headers = {"Authorization": f"Bearer {token}"}
-    params = {"ref": branch}
-
-    resp = requests.get(url, headers=headers, params=params)
-    if resp.status_code == 200:
-        return resp.text
-    else:
-        logger.warning(f"Failed to fetch raw content for {file_path}: {resp.status_code} {resp.text}")
-        return ""
-
-
-def parse_gitlab_dependencies(project_url: str, token: str, branch: str = "main"):
-    """
-    1) Extracts the project path 'group/project' from the project_url
-    2) Lists file paths (paginated) via GraphQL
-    3) Filters file paths by fnmatch patterns from LANGUAGE_DEPENDENCY_FILES
-    4) For each matching file path, fetches raw file content (REST)
-    5) Parses dependencies using LANGUAGE_DEPENDENCY_FILES
-    """
-    logger.info("Starting parse_gitlab_dependencies...")
-    project_path = "/".join(project_url.strip("/").split("/")[3:])
-    logger.info(f"Project path: {project_path}, branch: {branch}")
-
-    # Step 2: Paginated file listing
-    all_file_paths = list_repo_files_via_graphql_paginated(project_path, branch, token)
-    if not all_file_paths:
-        logger.warning("No files found in the repository (or you have no access).")
-        return {}
-
-    # Step 3: Create a set of all patterns (fnmatch) that we care about
+    # Collect all patterns from LANGUAGE_DEPENDENCY_FILES
     all_patterns = []
     for patterns_dict in LANGUAGE_DEPENDENCY_FILES.values():
-        for pattern in patterns_dict.keys():
-            all_patterns.append(pattern)
+        all_patterns.extend(patterns_dict.keys())
 
-    # Filter file paths by any matching pattern
-    matching_file_paths = []
-    for file_path in all_file_paths:
-        # We only keep the file if it matches at least one pattern
-        for pattern in all_patterns:
-            if fnmatch.fnmatch(file_path, pattern):
-                matching_file_paths.append(file_path)
+    matching = []
+    for file_path in all_paths:
+        # If at least one pattern matches, we keep the file
+        for pat in all_patterns:
+            if fnmatch.fnmatch(file_path, pat):
+                matching.append(file_path)
                 break
+    return matching
 
-    logger.info(f"{len(matching_file_paths)} files match known dependency patterns out of {len(all_file_paths)} total.")
+# --------------------------------------------------------------------------------
+# 3) For the filtered paths, fetch content with blobs(paths=[...]) -> rawTextBlob
+#    But we can only request up to 100 paths at a time, so we chunk them.
+# --------------------------------------------------------------------------------
 
+RAWBLOB_QUERY = """
+query FetchRawBlobs($fullPath: ID!, $ref: String!, $paths: [String!]!) {
+  project(fullPath: $fullPath) {
+    repository {
+      blobs(ref: $ref, paths: $paths) {
+        nodes {
+          path
+          # rawTextBlob is only available if the file is not too large/binary
+          rawTextBlob
+        }
+      }
+    }
+  }
+}
+"""
+
+def fetch_raw_texts_graphql(token: str, full_path: str, ref: str, paths_batch: List[str]) -> Dict[str, str]:
+    """
+    Given up to 100 file paths, uses GitLab GraphQL to fetch 'rawTextBlob' for each path.
+    Returns a dict: { file_path: rawText or None }.
+    """
+
+    base_url = "https://gitlab.com/api/graphql"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    variables = {
+        "fullPath": full_path,
+        "ref": ref,
+        "paths": paths_batch
+    }
+
+    resp = requests.post(
+        base_url,
+        json={"query": RAWBLOB_QUERY, "variables": variables},
+        headers=headers
+    )
+    if resp.status_code != 200:
+        raise Exception(f"GitLab GraphQL error: {resp.status_code} {resp.text}")
+
+    data = resp.json()
+    # logger.debug(f"RawText response for {paths_batch}: {data}")
+
+    repo_data = data.get("data", {}).get("project", {}).get("repository", {})
+    blobs = repo_data.get("blobs", {}).get("nodes", [])
+
+    result = {}
+    for blob in blobs:
+        p = blob.get("path")
+        raw_text = blob.get("rawTextBlob")
+        result[p] = raw_text
+
+    return result
+
+# --------------------------------------------------------------------------------
+# 4) Parse the downloaded text using LANGUAGE_DEPENDENCY_FILES
+# --------------------------------------------------------------------------------
+
+def parse_files_for_dependencies(file_contents: Dict[str, str]) -> Dict[str, Set[str]]:
+    """
+    file_contents: { "requirements.txt": "<file text>", ... }
+    We check each path against LANGUAGE_DEPENDENCY_FILES and parse it if matched.
+    Return structure: {language: set_of_dependencies}
+    """
     user_language_dependencies = {}
 
-    # Step 4 and 5: Fetch raw content and parse
-    for file_path in matching_file_paths:
-        content = get_raw_file_content(project_path, file_path, branch, token)
-        if not content:
+    for path, text in file_contents.items():
+        if not text:  # Could be None or empty if file is too large/binary
             continue
 
-        # Match again by language to pick the right parser
-        for lang, patterns in LANGUAGE_DEPENDENCY_FILES.items():
-            for pattern, parser in patterns.items():
-                if fnmatch.fnmatch(file_path, pattern):
-                    logger.info(f"File {file_path} matched pattern '{pattern}' for language {lang}")
+        # Find matching parser
+        for lang, patterns_dict in LANGUAGE_DEPENDENCY_FILES.items():
+            for pattern, parser_fn in patterns_dict.items():
+                if fnmatch.fnmatch(path, pattern):
+                    logger.info(f"File {path} matched pattern {pattern} for language {lang}")
                     try:
-                        dependencies = parser(content)
-                        if dependencies:
-                            logger.info(f"Dependencies found in {file_path}: {dependencies}")
+                        deps = parser_fn(text)
+                        if deps:
+                            if lang not in user_language_dependencies:
+                                user_language_dependencies[lang] = set()
+                            user_language_dependencies[lang].update(deps)
+                            logger.info(f"Dependencies found in {path}: {deps}")
                         else:
-                            logger.warning(f"No dependencies found in {file_path} using parser {parser.__name__}")
-
-                        if lang not in user_language_dependencies:
-                            user_language_dependencies[lang] = set()
-                        user_language_dependencies[lang].update(dependencies)
+                            logger.warning(f"No dependencies found in {path}")
                     except Exception as e:
-                        logger.error(f"Error parsing dependencies in {file_path}: {e}")
+                        logger.error(f"Error parsing dependencies in {path}: {e}")
 
-    logger.info("Finished parsing dependencies.")
     return user_language_dependencies
 
+# --------------------------------------------------------------------------------
+# Main function combining all steps
+# --------------------------------------------------------------------------------
 
-def smart_search_with_graphql(project_url: str, token: str, branch: str = "main"):
+def parse_dependencies_full_graphql(
+    project_url: str,
+    token: str,
+    branch: str = "main"
+) -> Dict[str, Set[str]]:
     """
-    Wrapper function to parse dependencies in a GitLab repository with pagination for all files,
-    filtering them by known dependency-file patterns before downloading.
+    1) Collect *all* file paths from the GitLab repository via GraphQL (tree).
+    2) Filter them by patterns from LANGUAGE_DEPENDENCY_FILES.
+    3) Chunk these paths (<= 100 each) and fetch rawTextBlob via GraphQL's blobs(paths=...).
+    4) Parse them for dependencies.
+    5) Return {language: set_of_dependencies}.
     """
-    logger.info("Starting smart_search_with_graphql...")
-    try:
-        dependencies = parse_gitlab_dependencies(project_url, token, branch)
-        return dependencies
-    except Exception as e:
-        logger.error(f"Error during smart_search_with_graphql: {e}")
+    logger.info("Starting parse_dependencies_full_graphql...")
+
+    # Extract "group/project" from e.g. "https://gitlab.com/group/project"
+    full_path = "/".join(project_url.strip("/").split("/")[3:])
+    logger.info(f"Working on {full_path} (branch: {branch})")
+
+    # Step 1: Collect all paths
+    all_paths = fetch_all_paths_graphql(token, full_path, branch)
+    logger.info(f"Total {len(all_paths)} files in repo.")
+
+    if not all_paths:
         return {}
 
+    # Step 2: Filter them by known patterns
+    candidate_paths = filter_paths_by_dependency_patterns(all_paths)
+    logger.info(f"{len(candidate_paths)} files match known dependency patterns.")
 
-def invoke_smart_search():
+    if not candidate_paths:
+        return {}
+
+    # Step 3: Chunk them in batches of up to 100
+    user_language_dependencies = {}
+
+    BATCH_SIZE = 100
+    num_batches = ceil(len(candidate_paths) / BATCH_SIZE)
+    logger.info(f"Fetching rawTextBlob in {num_batches} batch(es).")
+
+    start_index = 0
+    for batch_i in range(num_batches):
+        batch_paths = candidate_paths[start_index : start_index + BATCH_SIZE]
+        start_index += BATCH_SIZE
+
+        logger.info(f"Batch {batch_i+1}/{num_batches}: {len(batch_paths)} files.")
+        # Fetch raw text for these files
+        path_to_text = fetch_raw_texts_graphql(token, full_path, branch, batch_paths)
+
+        # Step 4: Parse them
+        batch_deps = parse_files_for_dependencies(path_to_text)
+        # Merge into main dictionary
+        for lang, deps in batch_deps.items():
+            if lang not in user_language_dependencies:
+                user_language_dependencies[lang] = set()
+            user_language_dependencies[lang].update(deps)
+
+    logger.info("Finished parse_dependencies_full_graphql.")
+    return user_language_dependencies
+
+# --------------------------------------------------------------------------------
+# Example usage
+# --------------------------------------------------------------------------------
+
+def main():
     """
-    Test function to demonstrate usage of 'smart_search_with_graphql'.
+    Example usage of parse_dependencies_full_graphql,
+    fetching & parsing dependencies with pure GraphQL (no REST).
     """
-    project_url = "https://gitlab.com/cerfacs/batman"
+    project_url = "https://gitlab.com/gitlab-org/gitaly"
     token = "glpat-8rre52gVcx-zs5L3qxGN"
-    branch = "develop"  # or whichever branch you actually need
-    deps = smart_search_with_graphql(project_url, token, branch)
-    print("Dependencies (for main integration):", deps)
+    branch = "master"  # or "develop", or "main"
 
+    deps = parse_dependencies_full_graphql(project_url, token, branch)
+    print("Dependencies found (pure GraphQL):")
+    for lang, dep_list in deps.items():
+        print(f"Language: {lang}, Dependencies: {sorted(dep_list)}")
 
 if __name__ == "__main__":
-    invoke_smart_search()
+    main()
