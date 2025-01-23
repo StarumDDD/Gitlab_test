@@ -8,10 +8,6 @@ from dependency_parser_lib.language_depfiles import LANGUAGE_DEPENDENCY_FILES
 logger = logging.getLogger("smart_search")
 logging.basicConfig(level=logging.INFO)
 
-# --------------------------------------------------------------------------------
-# 1) Collect all file paths via tree(...) -> blobs(...) -> path
-# --------------------------------------------------------------------------------
-
 LIST_PATHS_QUERY = """
 query FetchPaths($fullPath: ID!, $ref: String!, $after: String) {
   project(fullPath: $fullPath) {
@@ -94,9 +90,6 @@ def fetch_all_paths_graphql(token: str, full_path: str, ref: str) -> List[str]:
 
     return all_file_paths
 
-# --------------------------------------------------------------------------------
-# 2) Filter paths by fnmatch patterns from LANGUAGE_DEPENDENCY_FILES
-# --------------------------------------------------------------------------------
 
 def filter_paths_by_dependency_patterns(all_paths: List[str]) -> List[str]:
     """
@@ -116,10 +109,6 @@ def filter_paths_by_dependency_patterns(all_paths: List[str]) -> List[str]:
                 break
     return matching
 
-# --------------------------------------------------------------------------------
-# 3) For the filtered paths, fetch content with blobs(paths=[...]) -> rawTextBlob
-#    But we can only request up to 100 paths at a time, so we chunk them.
-# --------------------------------------------------------------------------------
 
 RAWBLOB_QUERY = """
 query FetchRawBlobs($fullPath: ID!, $ref: String!, $paths: [String!]!) {
@@ -177,9 +166,6 @@ def fetch_raw_texts_graphql(token: str, full_path: str, ref: str, paths_batch: L
 
     return result
 
-# --------------------------------------------------------------------------------
-# 4) Parse the downloaded text using LANGUAGE_DEPENDENCY_FILES
-# --------------------------------------------------------------------------------
 
 def parse_files_for_dependencies(file_contents: Dict[str, str]) -> Dict[str, Set[str]]:
     """
@@ -212,9 +198,6 @@ def parse_files_for_dependencies(file_contents: Dict[str, str]) -> Dict[str, Set
 
     return user_language_dependencies
 
-# --------------------------------------------------------------------------------
-# Main function combining all steps
-# --------------------------------------------------------------------------------
 
 def parse_dependencies_full_graphql(
     project_url: str,
@@ -230,7 +213,7 @@ def parse_dependencies_full_graphql(
     """
     logger.info("Starting parse_dependencies_full_graphql...")
 
-    # Extract "group/project" from e.g. "https://gitlab.com/group/project"
+    # Extract "group/project"
     full_path = "/".join(project_url.strip("/").split("/")[3:])
     logger.info(f"Working on {full_path} (branch: {branch})")
 
@@ -275,9 +258,6 @@ def parse_dependencies_full_graphql(
     logger.info("Finished parse_dependencies_full_graphql.")
     return user_language_dependencies
 
-# --------------------------------------------------------------------------------
-# Example usage
-# --------------------------------------------------------------------------------
 
 def main():
     """
@@ -285,7 +265,7 @@ def main():
     fetching & parsing dependencies with pure GraphQL (no REST).
     """
     project_url = "https://gitlab.com/gitlab-org/gitaly"
-    token = "glpat-8rre52gVcx-zs5L3qxGN"
+    token = "YOUR_GITLAB_TOKEN"
     branch = "master"  # or "develop", or "main"
 
     deps = parse_dependencies_full_graphql(project_url, token, branch)
