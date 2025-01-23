@@ -229,7 +229,7 @@ def parse_gitlab_repo_primary_lang(
 
 def main():
     project_url = "https://gitlab.com/gitlab-org/gitlab-runner"
-    token = "glpat-KvAmGABXbknHMqNjUSud"
+    token = "token"
     branch = "main"
 
     result = parse_gitlab_repo_primary_lang(project_url, token, branch)
