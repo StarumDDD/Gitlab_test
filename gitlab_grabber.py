@@ -10,14 +10,14 @@ logger = logging.getLogger("smart_search")
 logging.basicConfig(level=logging.INFO)
 
 LANGS_AND_PATHS_QUERY = """
-query FetchLangsAndPaths($fullPath: ID!, $ref: String!, $after: String) {
+query FetchLangsAndPaths($fullPath: ID!, $after: String) {
   project(fullPath: $fullPath) {
     languages {
       name
       share
     }
     repository {
-      tree(ref: $ref, recursive: true) {
+      tree(recursive: true) {
         blobs(first: 100, after: $after) {
           pageInfo {
             hasNextPage
@@ -46,7 +46,6 @@ def fetch_languages_and_paths(
     }
     variables = {
         "fullPath": full_path,
-        "ref": ref,
         "after": after_cursor
     }
     payload = {
@@ -230,7 +229,7 @@ def parse_gitlab_repo_primary_lang(
 def main():
     project_url = "https://gitlab.com/gitlab-org/gitlab-runner"
     token = "token"
-    branch = "main"
+    branch = "master"
 
     result = parse_gitlab_repo_primary_lang(project_url, token, branch)
     print("Final dependencies:", result)
